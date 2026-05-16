@@ -45,9 +45,9 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         });
 
         const iconPath = GLib.build_filenamev([this._extensionPath, 'claude-icon-22.png']);
-        const gicon = Gio.icon_new_for_string(iconPath);
+        this._originalGicon = Gio.icon_new_for_string(iconPath);
         this._icon = new St.Icon({
-            gicon: gicon,
+            gicon: this._originalGicon,
             style_class: 'claude-icon',
             icon_size: 16,
         });
@@ -161,6 +161,20 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     }
 
     _createMenu() {
+        const refreshItem = new PopupMenu.PopupMenuItem('Refresh');
+        this._refreshIcon = new St.Icon({
+            icon_name: 'view-refresh-symbolic',
+            style_class: 'popup-menu-icon',
+            icon_size: 16,
+        });
+        refreshItem.insert_child_at_index(this._refreshIcon, 0);
+        refreshItem.connect('activate', () => {
+            this._pendingRefreshFeedback = true;
+            this._refreshUsage();
+        });
+        this.menu.addMenuItem(refreshItem);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
         const fiveHourBox = new St.BoxLayout({
             style_class: 'claude-usage-section',
             vertical: true,
@@ -265,6 +279,12 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         const settingsItem = new PopupMenu.PopupMenuItem('Settings');
+        const settingsIcon = new St.Icon({
+            icon_name: 'preferences-system-symbolic',
+            style_class: 'popup-menu-icon',
+            icon_size: 16,
+        });
+        settingsItem.insert_child_at_index(settingsIcon, 0);
         settingsItem.connect('activate', () => {
             this._openPreferences();
         });
@@ -386,6 +406,11 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         }
 
         this._renderPerModelSections(data);
+
+        if (this._pendingRefreshFeedback) {
+            this._pendingRefreshFeedback = false;
+            this._showRefreshSuccess();
+        }
     }
 
     _renderPerModelSections(data) {
@@ -446,6 +471,31 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._perModelSeparator.visible = visible;
     }
 
+    _showRefreshSuccess() {
+        this._refreshIcon.set_icon_name('emblem-ok-symbolic');
+
+        this._icon.set_gicon(null);
+        this._icon.set_icon_name('view-refresh-symbolic');
+        this._icon.add_style_class_name('claude-success-flash');
+        this._label.add_style_class_name('claude-success-flash');
+
+        this._refreshFeedbackTimer = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT,
+            2,
+            () => {
+                this._refreshIcon.set_icon_name('view-refresh-symbolic');
+
+                this._icon.set_icon_name('');
+                this._icon.set_gicon(this._originalGicon);
+                this._icon.remove_style_class_name('claude-success-flash');
+                this._label.remove_style_class_name('claude-success-flash');
+
+                this._refreshFeedbackTimer = null;
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+    }
+
     _updatePanelProgressBar(usage) {
         const maxWidth = 50;
         const width = Math.round((Math.min(100, Math.max(0, usage)) / 100) * maxWidth);
@@ -500,6 +550,10 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     }
 
     destroy() {
+        if (this._refreshFeedbackTimer) {
+            GLib.source_remove(this._refreshFeedbackTimer);
+            this._refreshFeedbackTimer = null;
+        }
         this._stopTimer();
         if (this._session) {
             this._session.abort();
