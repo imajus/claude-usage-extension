@@ -141,6 +141,18 @@ export default class ClaudeUsagePreferences extends ExtensionPreferences {
         );
         menuGroup.add(showPerModelRow);
 
+        const showPeakHoursRow = new Adw.SwitchRow({
+            title: 'Show Peak / Off-Peak Period',
+            subtitle: 'Show current Claude peak-hours status and a progress bar of the current period (data: promoclock.co)',
+        });
+        settings.bind(
+            'show-peak-hours',
+            showPeakHoursRow,
+            'active',
+            Gio.SettingsBindFlags.DEFAULT
+        );
+        menuGroup.add(showPeakHoursRow);
+
         const networkGroup = new Adw.PreferencesGroup({
             title: 'Network',
             description: 'Configure network settings',

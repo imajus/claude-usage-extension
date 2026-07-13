@@ -16,6 +16,67 @@ const TOKEN_URL = 'https://api.anthropic.com/v1/oauth/token';
 const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 
+// Peak hours: weekdays 13:00–19:00 UTC. Logic mirrored from
+// github.com/imajus/promoclock src/app/api/status/route.ts so we can compute
+// it locally without a network call.
+const PEAK_START_UTC = 13;
+const PEAK_END_UTC = 19;
+
+function _peakNextChange(now, dayUTC, hourUTC, isPeak, isWeekend) {
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth();
+    const date = now.getUTCDate();
+    if (isWeekend) {
+        const daysToMonday = dayUTC === 6 ? 2 : 1;
+        return new Date(Date.UTC(year, month, date + daysToMonday, PEAK_START_UTC, 0, 0));
+    }
+    if (isPeak)
+        return new Date(Date.UTC(year, month, date, PEAK_END_UTC, 0, 0));
+    if (hourUTC < PEAK_START_UTC)
+        return new Date(Date.UTC(year, month, date, PEAK_START_UTC, 0, 0));
+    const tomorrowDay = (dayUTC + 1) % 7;
+    if (tomorrowDay === 6) return new Date(Date.UTC(year, month, date + 3, PEAK_START_UTC, 0, 0));
+    if (tomorrowDay === 0) return new Date(Date.UTC(year, month, date + 2, PEAK_START_UTC, 0, 0));
+    return new Date(Date.UTC(year, month, date + 1, PEAK_START_UTC, 0, 0));
+}
+
+function _peakPrevChange(now, dayUTC, hourUTC, isPeak, isWeekend) {
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth();
+    const date = now.getUTCDate();
+    if (isPeak)
+        return new Date(Date.UTC(year, month, date, PEAK_START_UTC, 0, 0));
+    if (isWeekend) {
+        // dayUTC: 6 = Saturday, 0 = Sunday. Off-peak began at Friday 19:00 UTC.
+        const daysBackToFriday = dayUTC === 6 ? 1 : 2;
+        return new Date(Date.UTC(year, month, date - daysBackToFriday, PEAK_END_UTC, 0, 0));
+    }
+    if (hourUTC < PEAK_START_UTC) {
+        // Weekday morning before peak. Off-peak began at the previous weekday's 19:00 UTC.
+        // dayUTC 1 (Mon) → Fri (−3 days); otherwise yesterday.
+        const daysBack = dayUTC === 1 ? 3 : 1;
+        return new Date(Date.UTC(year, month, date - daysBack, PEAK_END_UTC, 0, 0));
+    }
+    // Weekday evening after peak: off-peak began today at 19:00 UTC.
+    return new Date(Date.UTC(year, month, date, PEAK_END_UTC, 0, 0));
+}
+
+function _computePeakStatus(now) {
+    const dayUTC = now.getUTCDay();
+    const hourUTC = now.getUTCHours();
+    const isWeekend = dayUTC === 0 || dayUTC === 6;
+    const isPeak = !isWeekend && hourUTC >= PEAK_START_UTC && hourUTC < PEAK_END_UTC;
+    const nextChange = _peakNextChange(now, dayUTC, hourUTC, isPeak, isWeekend);
+    const prevChange = _peakPrevChange(now, dayUTC, hourUTC, isPeak, isWeekend);
+    return {
+        isPeak,
+        label: isPeak ? 'Peak — Drains Faster' : 'Off-Peak — Normal',
+        prevChange,
+        nextChange,
+        minutesUntilChange: Math.floor((nextChange.getTime() - now.getTime()) / 60000),
+    };
+}
+
 const PER_MODEL_LABEL_MAP = {
     opus: 'Opus',
     sonnet: 'Sonnet',
@@ -77,6 +138,17 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         this._createMenu();
 
+        this._menuOpenChangedId = this.menu.connect('open-state-changed', (_menu, open) => {
+            if (open) {
+                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    this._relayoutProgressBars();
+                    return GLib.SOURCE_REMOVE;
+                });
+                if (this._settings.get_boolean('show-peak-hours'))
+                    this._updatePeakDisplay();
+            }
+        });
+
         this._updateDisplayMode();
         this._updateIconVisibility();
         this._updateIconStyle();
@@ -94,6 +166,8 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 this._updateIconStyle();
             } else if (key === 'show-per-model-weekly') {
                 this._updatePerModelVisibility();
+            } else if (key === 'show-peak-hours') {
+                this._updatePeakVisibility();
             }
         });
 
@@ -199,6 +273,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         const fiveHourProgressBg = new St.Widget({
             style_class: 'claude-progress-bg',
+            x_expand: true,
         });
         this._fiveHourProgressBar = new St.Widget({
             style_class: 'claude-progress-bar usage-low',
@@ -242,6 +317,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         const sevenDayProgressBg = new St.Widget({
             style_class: 'claude-progress-bg',
+            x_expand: true,
         });
         this._sevenDayProgressBar = new St.Widget({
             style_class: 'claude-progress-bar usage-low',
@@ -261,6 +337,53 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         });
         sevenDayItem.add_child(sevenDayBox);
         this.menu.addMenuItem(sevenDayItem);
+
+        this._peakSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._peakSeparator);
+
+        const peakBox = new St.BoxLayout({
+            style_class: 'claude-usage-section',
+            vertical: true,
+        });
+        const peakHeader = new St.BoxLayout({ vertical: false });
+        const peakTitleLabel = new St.Label({
+            text: 'Peak Hours',
+            style_class: 'claude-section-title',
+        });
+        peakHeader.add_child(peakTitleLabel);
+        this._peakStatusLabel = new St.Label({
+            text: '…',
+            style_class: 'claude-percent-label',
+            x_expand: true,
+            x_align: Clutter.ActorAlign.END,
+        });
+        peakHeader.add_child(this._peakStatusLabel);
+        peakBox.add_child(peakHeader);
+
+        const peakProgressBg = new St.Widget({
+            style_class: 'claude-progress-bg',
+            x_expand: true,
+        });
+        this._peakProgressBar = new St.Widget({
+            style_class: 'claude-progress-bar usage-low',
+        });
+        peakProgressBg.add_child(this._peakProgressBar);
+        peakBox.add_child(peakProgressBg);
+
+        this._peakChangeLabel = new St.Label({
+            text: '…',
+            style_class: 'claude-reset-label',
+        });
+        peakBox.add_child(this._peakChangeLabel);
+
+        this._peakMenuItem = new PopupMenu.PopupBaseMenuItem({
+            reactive: false,
+            can_focus: false,
+        });
+        this._peakMenuItem.add_child(peakBox);
+        this.menu.addMenuItem(this._peakMenuItem);
+
+        this._updatePeakVisibility();
 
         this._perModelSeparator = new PopupMenu.PopupSeparatorMenuItem();
         this.menu.addMenuItem(this._perModelSeparator);
@@ -324,6 +447,8 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     }
 
     _refreshUsage() {
+        if (this._settings.get_boolean('show-peak-hours'))
+            this._updatePeakDisplay();
         if (this._fetching) return;
         this._fetching = true;
         const ownToken = this._settings.get_string('access-token');
@@ -456,6 +581,9 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     _updateDisplay(data) {
         const fiveHour = data.five_hour?.utilization ?? 0;
         const sevenDay = data.seven_day?.utilization ?? 0;
+        this._lastFiveHour = fiveHour;
+        this._lastSevenDay = sevenDay;
+        this._lastUsageData = data;
 
         this._label.set_text(`${Math.round(fiveHour)}%`);
 
@@ -485,6 +613,17 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             this._pendingRefreshFeedback = false;
             this._showRefreshSuccess();
         }
+    }
+
+    _relayoutProgressBars() {
+        if (this._lastFiveHour != null)
+            this._updateProgressBar(this._fiveHourProgressBar, this._lastFiveHour);
+        if (this._lastSevenDay != null)
+            this._updateProgressBar(this._sevenDayProgressBar, this._lastSevenDay);
+        if (this._settings.get_boolean('show-peak-hours'))
+            this._updatePeakDisplay();
+        if (this._lastUsageData)
+            this._renderPerModelSections(this._lastUsageData);
     }
 
     _renderPerModelSections(data) {
@@ -517,7 +656,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             header.add_child(percentLabel);
             sectionBox.add_child(header);
 
-            const progressBg = new St.Widget({style_class: 'claude-progress-bg'});
+            const progressBg = new St.Widget({style_class: 'claude-progress-bg', x_expand: true});
             const progressBar = new St.Widget({style_class: 'claude-progress-bar'});
             progressBg.add_child(progressBar);
             sectionBox.add_child(progressBg);
@@ -571,14 +710,33 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     }
 
     _updatePanelProgressBar(usage) {
-        const maxWidth = 50;
+        const parent = this._panelProgressBar.get_parent();
+        const maxWidth = parent && parent.get_width() > 0 ? parent.get_width() : 50;
         const width = Math.round((Math.min(100, Math.max(0, usage)) / 100) * maxWidth);
         this._panelProgressBar.set_width(width);
     }
 
+    _progressTrackWidth(progressBar) {
+        const parent = progressBar?.get_parent();
+        if (!parent)
+            return 0;
+        const allocated = parent.get_width();
+        if (allocated > 0)
+            return allocated;
+        try {
+            const box = parent.get_allocation_box();
+            const w = Math.round(box.x2 - box.x1);
+            if (w > 0)
+                return w;
+        } catch (_e) {}
+        return 0;
+    }
+
     _updateProgressBar(progressBar, usage) {
-        const maxWidth = 200;
-        const width = Math.round((Math.min(100, Math.max(0, usage)) / 100) * maxWidth);
+        const trackWidth = this._progressTrackWidth(progressBar);
+        const maxWidth = trackWidth > 0 ? trackWidth : 200;
+        const clampedUsage = Math.min(100, Math.max(0, usage));
+        const width = Math.round((clampedUsage / 100) * maxWidth);
         progressBar.set_width(width);
 
         progressBar.remove_style_class_name('usage-low');
@@ -595,6 +753,54 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         } else {
             progressBar.add_style_class_name('usage-low');
         }
+    }
+
+    _updatePeakVisibility() {
+        const visible = this._settings.get_boolean('show-peak-hours');
+        this._peakMenuItem.visible = visible;
+        this._peakSeparator.visible = visible;
+        if (visible)
+            this._updatePeakDisplay();
+    }
+
+    _updatePeakDisplay() {
+        const now = new Date();
+        const status = _computePeakStatus(now);
+
+        this._peakStatusLabel.set_text(status.label);
+
+        let progress = 0;
+        if (status.nextChange > status.prevChange) {
+            progress = ((now - status.prevChange) / (status.nextChange - status.prevChange)) * 100;
+            progress = Math.min(100, Math.max(0, progress));
+        }
+
+        const maxWidth = this._progressTrackWidth(this._peakProgressBar) || 200;
+        const peakWidth = Math.round((progress / 100) * maxWidth);
+        this._peakProgressBar.set_width(peakWidth);
+
+        this._peakProgressBar.remove_style_class_name('usage-low');
+        this._peakProgressBar.remove_style_class_name('usage-medium');
+        this._peakProgressBar.remove_style_class_name('usage-high');
+        this._peakProgressBar.remove_style_class_name('usage-critical');
+        this._peakProgressBar.add_style_class_name(status.isPeak ? 'usage-high' : 'usage-low');
+
+        const nextLabel = status.isPeak ? 'Off-Peak' : 'Peak';
+        this._peakChangeLabel.set_text(
+            `Switches to ${nextLabel} in ${this._formatMinutes(status.minutesUntilChange)}`
+        );
+    }
+
+    _formatMinutes(totalMinutes) {
+        const mins = Math.max(0, Math.round(totalMinutes));
+        const days = Math.floor(mins / 1440);
+        const hours = Math.floor((mins % 1440) / 60);
+        const minutes = mins % 60;
+        if (days > 0)
+            return `${days}d ${hours}h`;
+        if (hours > 0)
+            return `${hours}h ${minutes}m`;
+        return `${minutes}m`;
     }
 
     _formatResetTime(isoString) {
@@ -636,6 +842,10 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         if (this._settingsChangedId) {
             this._settings.disconnect(this._settingsChangedId);
             this._settingsChangedId = null;
+        }
+        if (this._menuOpenChangedId) {
+            this.menu.disconnect(this._menuOpenChangedId);
+            this._menuOpenChangedId = null;
         }
         super.destroy();
     }
